@@ -72,8 +72,8 @@ async def cmd_pipeline(cfg: FPLConfig) -> pd.DataFrame:
             f"  {names_map.get(int(row['player_id']), '?'):>18s}  "
             f"pos={int(row['element_type'])}  "
             f"xMin={row['xmin']:5.1f}  "
-            f"xP90={row['xp90']:5.2f}  "
-            f"xP_final={row['xp_final']:5.2f}  "
+            f"xQual={row['xp_quality']:5.2f}  "
+            f"xP={row['xp_final']:5.2f}  "
             f"VORP={row['vorp']:+.2f}"
         )
 

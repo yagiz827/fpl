@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -22,7 +24,8 @@ log = logging.getLogger(__name__)
 # ── Column subsets kept from each API response ───────────────
 
 _ELEMENT_COLS = [
-    "id", "web_name", "team", "element_type", "status",
+    "id", "first_name", "second_name", "web_name",
+    "team", "element_type", "status",
     "chance_of_playing_next_round", "penalties_order",
     "minutes", "starts", "expected_goals", "expected_assists",
     "expected_goal_involvements", "expected_goals_conceded",
@@ -44,7 +47,6 @@ _FIXTURE_COLS = [
     "team_h_difficulty", "team_a_difficulty", "finished",
 ]
 
-# Columns the FPL API returns as strings that must be numeric
 _NUMERIC_COLS = {
     "minutes", "starts", "goals_scored", "assists", "clean_sheets",
     "expected_goals", "expected_assists",
@@ -64,6 +66,98 @@ def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Local CSV loader (prior seasons)
+# ═══════════════════════════════════════════════════════════════
+
+def load_prior_seasons(
+    current_players: pd.DataFrame,
+    cfg: FPLConfig = CONF,
+) -> pd.DataFrame:
+    """Load per-GW CSVs from prior season(s) and map to current player IDs.
+
+    Reads ``data/2024-25/players/*/gw.csv``, bridges player IDs via
+    (first_name, second_name) matching against the current bootstrap,
+    and returns rows with an offset ``round`` column so they sort
+    chronologically before the current season.
+    """
+    data_dir = Path(cfg.LOCAL_DATA_DIR)
+    prior_dir = data_dir / "2024-25"
+
+    if not prior_dir.is_dir():
+        log.warning("Prior season dir not found: %s", prior_dir)
+        return pd.DataFrame()
+
+    # ── build current name → player_id map ───────────────────
+    name_to_id: dict[tuple[str, str], int] = {}
+    for _, row in current_players.iterrows():
+        key = (
+            str(row["first_name"]).strip().lower(),
+            str(row["second_name"]).strip().lower(),
+        )
+        name_to_id[key] = int(row["id"])
+
+    # ── build prior element_id → name map via cleaned_players ─
+    cleaned_path = prior_dir / "cleaned_players.csv"
+    if not cleaned_path.is_file():
+        log.warning("No cleaned_players.csv in %s", prior_dir)
+        return pd.DataFrame()
+
+    cleaned = pd.read_csv(cleaned_path)
+    prev_id_to_name: dict[int, tuple[str, str]] = {}
+    for idx, row in cleaned.iterrows():
+        eid = idx + 1  # element_id is 1-indexed row order
+        prev_id_to_name[eid] = (
+            str(row["first_name"]).strip().lower(),
+            str(row["second_name"]).strip().lower(),
+        )
+
+    # ── read all gw.csv files ────────────────────────────────
+    players_dir = prior_dir / "players"
+    if not players_dir.is_dir():
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    for player_subdir in players_dir.iterdir():
+        gw_path = player_subdir / "gw.csv"
+        if not gw_path.is_file():
+            continue
+        try:
+            frames.append(pd.read_csv(gw_path))
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+
+    prev = pd.concat(frames, ignore_index=True)
+    prev = _coerce_numeric(prev)
+
+    # ── map prior element → current player_id via name bridge ─
+    prev["_name_key"] = prev["element"].map(
+        lambda eid: prev_id_to_name.get(int(eid), ("", ""))
+    )
+    prev["player_id"] = prev["_name_key"].map(
+        lambda nk: name_to_id.get(nk)
+    )
+    before = len(prev)
+    prev = prev.dropna(subset=["player_id"])
+    prev["player_id"] = prev["player_id"].astype(int)
+    matched = len(prev)
+    log.info(
+        "2024-25 local data: %d GW rows loaded, %d matched to current IDs "
+        "(%d unmatched / transferred out)",
+        before, matched, before - matched,
+    )
+
+    # Offset rounds so 2024-25 comes before 2025-26 chronologically
+    prev["round"] = prev["round"] - 38
+
+    # Select only the columns the pipeline expects
+    keep = [c for c in _HISTORY_COLS if c in prev.columns]
+    return prev[keep].copy()
+
+
+# ═══════════════════════════════════════════════════════════════
 # FPL Async Client
 # ═══════════════════════════════════════════════════════════════
 
@@ -74,8 +168,6 @@ class FPLClient:
         self._base = cfg.BASE_URL
         self._sem = asyncio.Semaphore(cfg.API_CONCURRENCY)
         self._delay = cfg.API_REQUEST_DELAY
-
-    # ── low-level GET ────────────────────────────────────────
 
     async def _get_json(
         self, session: aiohttp.ClientSession, url: str, retries: int = 3
@@ -95,25 +187,14 @@ class FPLClient:
                 await asyncio.sleep(wait)
         raise RuntimeError(f"Failed to fetch {url} after {retries} retries")
 
-    # ── endpoint wrappers ────────────────────────────────────
-
-    async def fetch_bootstrap(
-        self, session: aiohttp.ClientSession
-    ) -> dict[str, Any]:
+    async def fetch_bootstrap(self, session: aiohttp.ClientSession) -> dict[str, Any]:
         return await self._get_json(session, f"{self._base}/bootstrap-static/")
 
-    async def fetch_player_summary(
-        self, session: aiohttp.ClientSession, player_id: int
-    ) -> dict[str, Any]:
-        url = f"{self._base}/element-summary/{player_id}/"
-        return await self._get_json(session, url)
+    async def fetch_player_summary(self, session: aiohttp.ClientSession, player_id: int) -> dict[str, Any]:
+        return await self._get_json(session, f"{self._base}/element-summary/{player_id}/")
 
-    async def fetch_fixtures(
-        self, session: aiohttp.ClientSession
-    ) -> list[dict[str, Any]]:
+    async def fetch_fixtures(self, session: aiohttp.ClientSession) -> list[dict[str, Any]]:
         return await self._get_json(session, f"{self._base}/fixtures/")
-
-    # ── bulk player history ──────────────────────────────────
 
     async def fetch_all_histories(
         self, session: aiohttp.ClientSession, player_ids: list[int]
@@ -127,26 +208,29 @@ class FPLClient:
         await asyncio.gather(*(_one(pid) for pid in player_ids))
         return results
 
-    # ── top-level ingest ─────────────────────────────────────
-
-    async def ingest(
-        self,
-    ) -> tuple[dict[str, Any], dict[int, list[dict]], list[dict]]:
-        """Fetch bootstrap, all active-player histories, and fixtures."""
+    async def ingest(self) -> tuple[dict[str, Any], dict[int, list[dict]], list[dict]]:
         timeout = aiohttp.ClientTimeout(total=300)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             bootstrap = await self.fetch_bootstrap(session)
             fixtures = await self.fetch_fixtures(session)
 
+            # Hard filter: only players currently registered in the PL.
+            # status: 'a' = available, 'i' = injured, 'd' = doubtful,
+            #         'u' = unavailable, 'n' = not in squad / transferred out
+            # We keep a/i/d (still at a PL club), drop u/n (gone).
+            _ACTIVE_STATUSES = {"a", "i", "d"}
             active_ids = [
-                e["id"]
-                for e in bootstrap["elements"]
-                if e["minutes"] > 0
-                or e.get("chance_of_playing_next_round") not in (None, 0)
+                e["id"] for e in bootstrap["elements"]
+                if e.get("status", "n") in _ACTIVE_STATUSES
+                and (e["minutes"] > 0
+                     or e.get("chance_of_playing_next_round") not in (None, 0))
             ]
-            log.info("Fetching history for %d active players …", len(active_ids))
+            dropped = len(bootstrap["elements"]) - len(active_ids)
+            log.info(
+                "Fetching history for %d active players (%d filtered out as "
+                "transferred / unavailable) …", len(active_ids), dropped,
+            )
             histories = await self.fetch_all_histories(session, active_ids)
-
         return bootstrap, histories, fixtures
 
 
@@ -171,14 +255,11 @@ class FeatureEngineer:
         return _coerce_numeric(pdf[_ELEMENT_COLS].copy())
 
     @staticmethod
-    def build_history_frame(
-        histories: dict[int, list[dict[str, Any]]]
-    ) -> pd.DataFrame:
+    def build_history_frame(histories: dict[int, list[dict[str, Any]]]) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
         for pid, gw_list in histories.items():
             for gw in gw_list:
-                row = {**gw, "player_id": pid}
-                rows.append(row)
+                rows.append({**gw, "player_id": pid})
         if not rows:
             raise ValueError("No gameweek history available — is the season underway?")
         pdf = pd.DataFrame(rows)
@@ -195,25 +276,17 @@ class FeatureEngineer:
                 pdf[c] = np.nan
         return _coerce_numeric(pdf[_FIXTURE_COLS].copy())
 
-    # ── non-penalty xG ───────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────
 
     def _estimate_npxg(self, history: pd.DataFrame) -> pd.Series:
-        """npxG ≈ xG − (penalties_scored × 0.76).
-
-        Penalties scored per GW is unobservable directly; we approximate it
-        as max(0, goals − xG) clipped to at most 2.  This is a conservative
-        heuristic — for higher accuracy, supplement with Understat/FBref data.
-        """
         pen_scored_est = (
             (history["goals_scored"] - history["expected_goals"])
             .clip(lower=0, upper=2)
         )
         return (history["expected_goals"] - pen_scored_est * self.cfg.PEN_XG_VALUE).clip(lower=0)
 
-    # ── team-level xG-conceded rolling ───────────────────────
-
-    def _team_xgc_rolling(self, history: pd.DataFrame) -> pd.DataFrame:
-        """Per-team rolling non-penalty xG conceded (opponent attacking strength)."""
+    def _team_xgc_table(self, history: pd.DataFrame) -> pd.DataFrame:
+        """Per-(team, round) table of xG conceded + rolling averages + xCS."""
         team_gw = (
             history
             .groupby(["opponent_team", "round"], sort=False)
@@ -228,24 +301,37 @@ class FeatureEngineer:
         team_gw = team_gw.sort_values(["team", "round"]).reset_index(drop=True)
 
         for w in self.cfg.ROLLING_WINDOWS:
-            col = f"team_xgc_{w}gw"
-            team_gw[col] = (
+            team_gw[f"team_xgc_{w}gw"] = (
                 team_gw.groupby("team")["xg_conceded"]
                 .transform(lambda s: s.rolling(w, min_periods=1).mean())
             )
-
         team_gw["team_xgc_season"] = (
             team_gw.groupby("team")["xg_conceded"]
             .transform(lambda s: s.expanding(min_periods=1).mean())
         )
+
+        wl = [f"{w}gw" for w in self.cfg.ROLLING_WINDOWS] + ["season"]
+        for label in wl:
+            team_gw[f"xcs_{label}"] = np.exp(-team_gw[f"team_xgc_{label}"])
+
+        team_gw["xcs_match"] = np.exp(-team_gw["xg_conceded"])
         return team_gw
 
-    # ── expected clean-sheet probability ─────────────────────
-
-    @staticmethod
-    def _xcs_from_xgc(xgc_series: pd.Series) -> pd.Series:
-        """P(clean sheet) ≈ e^(−opponent_xG) under a Poisson model."""
-        return np.exp(-xgc_series)
+    def _grouped_rolling(
+        self, df: pd.DataFrame, sources: dict[str, str]
+    ) -> pd.DataFrame:
+        """Add rolling 3gw/5gw/season means for each (source_col → prefix)."""
+        for src, prefix in sources.items():
+            for w in self.cfg.ROLLING_WINDOWS:
+                df[f"{prefix}_{w}gw"] = (
+                    df.groupby("player_id")[src]
+                    .transform(lambda s: s.rolling(w, min_periods=1).mean())
+                )
+            df[f"{prefix}_season"] = (
+                df.groupby("player_id")[src]
+                .transform(lambda s: s.expanding(min_periods=1).mean())
+            )
+        return df
 
     # ── main pipeline ────────────────────────────────────────
 
@@ -255,74 +341,103 @@ class FeatureEngineer:
         histories: dict[int, list[dict]],
         fixtures_raw: list[dict],
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Run full feature-engineering pipeline.
-
-        Returns
-        -------
-        players : pd.DataFrame   — static player attributes + season totals
-        history : pd.DataFrame   — per-GW rows with rolling features attached
-        fixtures : pd.DataFrame  — future fixture metadata
-        """
         players = self.build_players_frame(bootstrap)
         history = self.build_history_frame(histories)
         fixtures = self.build_fixtures_frame(fixtures_raw)
 
-        # element_type (position) lives only in bootstrap — join it in
-        history = history.merge(
-            players[["id", "element_type", "team"]].rename(columns={"id": "player_id"}),
-            on="player_id",
-            how="left",
-        )
+        # ── Merge local prior-season data ─────────────────────
+        prior = load_prior_seasons(players, self.cfg)
+        if len(prior) > 0:
+            log.info("Augmenting API history (%d rows) with 2024-25 data (%d rows)",
+                     len(history), len(prior))
+            history = pd.concat([prior, history], ignore_index=True)
 
+        # Join position + team + penalty + name from bootstrap
+        history = history.merge(
+            players[["id", "web_name", "element_type", "team", "penalties_order"]]
+            .rename(columns={"id": "player_id"}),
+            on="player_id", how="left",
+        )
+        history["is_pen_taker"] = np.where(
+            history["penalties_order"].fillna(99) <= 1, 1.0, 0.0
+        )
         history = history.sort_values(["player_id", "round"]).reset_index(drop=True)
 
-        # non-penalty xG per gameweek
+        # ── derived per-GW columns ───────────────────────────
         history["npxg"] = self._estimate_npxg(history)
 
-        # ── rolling features per player ──────────────────────
-        roll_cols = {
-            "npxg":             "npxg",
-            "expected_assists": "xa",
-            "minutes":          "xmin",
-            "starts":           "start_rate",
-            "total_points":     "pts",
-        }
-
-        for src, prefix in roll_cols.items():
-            for w in self.cfg.ROLLING_WINDOWS:
-                dst = f"{prefix}_{w}gw"
-                history[dst] = (
-                    history.groupby("player_id")[src]
-                    .transform(lambda s: s.rolling(w, min_periods=1).mean())
-                )
-
-            history[f"{prefix}_season"] = (
-                history.groupby("player_id")[src]
-                .transform(lambda s: s.expanding(min_periods=1).mean())
-            )
-
-        # ── team-level xGC rolling → xCS ─────────────────────
-        team_xgc = self._team_xgc_rolling(history)
-
-        for w_label in [f"{w}gw" for w in self.cfg.ROLLING_WINDOWS] + ["season"]:
-            xgc_col = f"team_xgc_{w_label}"
-            xcs_col = f"xcs_{w_label}"
-            team_xgc[xcs_col] = self._xcs_from_xgc(team_xgc[xgc_col])
-
-        merge_cols = (
-            ["team", "round"]
-            + [f"team_xgc_{w_label}" for w_label in
-               [f"{w}gw" for w in self.cfg.ROLLING_WINDOWS] + ["season"]]
-            + [f"xcs_{w_label}" for w_label in
-               [f"{w}gw" for w in self.cfg.ROLLING_WINDOWS] + ["season"]]
+        # Attacking-role proxy: xGI per minute (separates CDMs from AMs/wingers)
+        history["xgi_per_min"] = (
+            history["expected_goal_involvements"]
+            / history["minutes"].clip(lower=1)
         )
 
+        # Goal-threat ratio: what fraction of xGI is actual goal-scoring?
+        # High = clinical finisher (Haaland, Palmer), Low = creative volume
+        # without box entry (Enzo, Rice).  FPL rewards goals (4-6 pts)
+        # much more than assists (3 pts), so this ratio directly maps to
+        # point efficiency within the same xGI volume.
+        xgi_safe = history["expected_goal_involvements"].clip(lower=0.01)
+        history["goal_threat_ratio"] = (history["npxg"] / xgi_safe).clip(0, 1)
+
+        # ── rolling features ─────────────────────────────────
+        history = self._grouped_rolling(history, {
+            "npxg":               "npxg",
+            "expected_assists":   "xa",
+            "minutes":            "xmin",
+            "starts":             "start_rate",
+            "xgi_per_min":        "xgi_rate",
+            "goal_threat_ratio":  "goal_ratio",
+            "bonus":              "bonus",
+        })
+
+        # ── team-level xGC table ─────────────────────────────
+        team_xgc = self._team_xgc_table(history)
+        wl = [f"{w}gw" for w in self.cfg.ROLLING_WINDOWS] + ["season"]
+
+        # Merge 1 — own team → xCS (clean-sheet probability for DEF/GKP)
+        xcs_cols = [f"xcs_{label}" for label in wl] + ["xcs_match"]
         history = history.merge(
-            team_xgc[merge_cols],
-            left_on=["opponent_team", "round"],
-            right_on=["team", "round"],
-            how="left",
-        ).drop(columns=["team"], errors="ignore")
+            team_xgc[["team", "round"] + xcs_cols],
+            on=["team", "round"], how="left",
+        )
+
+        # Merge 2 — opponent → attacking fixture difficulty
+        opp_src = [f"team_xgc_{label}" for label in wl]
+        opp_df = team_xgc[["team", "round"] + opp_src].copy()
+        opp_rename = {"team": "opponent_team"}
+        for c in opp_src:
+            opp_rename[c] = c.replace("team_xgc_", "opp_xgc_")
+        opp_df = opp_df.rename(columns=opp_rename)
+        history = history.merge(opp_df, on=["opponent_team", "round"], how="left")
+
+        # ── structured xFPL target (per-GW expected FPL pts) ──
+        goal_v = history["element_type"].map(self.cfg.GOAL_PTS).astype(float)
+        cs_v = history["element_type"].map(self.cfg.CS_PTS).astype(float)
+        appearance = np.where(
+            history["minutes"] >= 60, 2.0,
+            np.where(history["minutes"] > 0, 1.0, 0.0),
+        )
+        xfpl_base = (
+            history["npxg"] * goal_v
+            + history["expected_assists"] * 3.0
+            + history["xcs_match"].fillna(0) * cs_v
+            + appearance
+            + history["bonus"]
+        )
+
+        # Talisman coefficient: penalty/set-piece takers generate a
+        # structurally higher point ceiling that raw xG/xA understates
+        # (penalty xG ≈ 0.76 but the FPL points payoff is 4-6 pts,
+        # plus bonus points from penalties scored are near-guaranteed).
+        talisman = np.where(
+            history["is_pen_taker"] == 1.0,
+            self.cfg.TALISMAN_BONUS,
+            1.0,
+        )
+        history["xfpl"] = xfpl_base * talisman
+
+        history = self._grouped_rolling(history, {"xfpl": "xfpl"})
 
         log.info(
             "Feature engineering complete: %d player-GW rows, %d columns",
@@ -338,7 +453,6 @@ class FeatureEngineer:
 async def run_ingestion(
     cfg: FPLConfig = CONF,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """End-to-end: fetch → parse → feature-engineer, return DataFrames."""
     client = FPLClient(cfg)
     bootstrap, histories, fixtures_raw = await client.ingest()
     eng = FeatureEngineer(cfg)
