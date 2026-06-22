@@ -267,6 +267,13 @@ class FeatureEngineer:
         history = self.build_history_frame(histories)
         fixtures = self.build_fixtures_frame(fixtures_raw)
 
+        # element_type (position) lives only in bootstrap — join it in
+        history = history.merge(
+            players[["id", "element_type", "team"]].rename(columns={"id": "player_id"}),
+            on="player_id",
+            how="left",
+        )
+
         history = history.sort_values(["player_id", "round"]).reset_index(drop=True)
 
         # non-penalty xG per gameweek
