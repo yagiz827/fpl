@@ -1,0 +1,6 @@
+aiohttp>=3.9
+cupy-cuda12x>=13.0
+xgboost>=2.1
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.5
