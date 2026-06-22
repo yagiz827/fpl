@@ -1,0 +1,12 @@
+# Python derleme ve önbellek dosyaları
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Geliştirici araçları (VS Code ayarları)
+.vscode/
+
+# İşletim sistemi kalıntıları
+.DS_Store
+Thumbs.db
