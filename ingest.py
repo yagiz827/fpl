@@ -44,6 +44,24 @@ _FIXTURE_COLS = [
     "team_h_difficulty", "team_a_difficulty", "finished",
 ]
 
+# Columns the FPL API returns as strings that must be numeric
+_NUMERIC_COLS = {
+    "minutes", "starts", "goals_scored", "assists", "clean_sheets",
+    "expected_goals", "expected_assists",
+    "expected_goal_involvements", "expected_goals_conceded",
+    "total_points", "bonus", "penalties_missed", "penalties_order",
+    "chance_of_playing_next_round",
+    "team_h_difficulty", "team_a_difficulty",
+}
+
+
+def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast known-numeric columns that the API may return as strings."""
+    for col in df.columns:
+        if col in _NUMERIC_COLS:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
 
 # ═══════════════════════════════════════════════════════════════
 # FPL Async Client
@@ -150,7 +168,7 @@ class FeatureEngineer:
         for c in _ELEMENT_COLS:
             if c not in pdf.columns:
                 pdf[c] = np.nan
-        return pdf[_ELEMENT_COLS].copy()
+        return _coerce_numeric(pdf[_ELEMENT_COLS].copy())
 
     @staticmethod
     def build_history_frame(
@@ -167,7 +185,7 @@ class FeatureEngineer:
         for c in _HISTORY_COLS:
             if c not in pdf.columns:
                 pdf[c] = np.nan
-        return pdf[_HISTORY_COLS].copy()
+        return _coerce_numeric(pdf[_HISTORY_COLS].copy())
 
     @staticmethod
     def build_fixtures_frame(fixtures: list[dict[str, Any]]) -> pd.DataFrame:
@@ -175,7 +193,7 @@ class FeatureEngineer:
         for c in _FIXTURE_COLS:
             if c not in pdf.columns:
                 pdf[c] = np.nan
-        return pdf[_FIXTURE_COLS].copy()
+        return _coerce_numeric(pdf[_FIXTURE_COLS].copy())
 
     # ── non-penalty xG ───────────────────────────────────────
 

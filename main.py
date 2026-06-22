@@ -193,8 +193,15 @@ async def cmd_waiver(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="FPL Draft Optimisation Engine — GPU-accelerated",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python main.py pipeline                          Full ingest -> VORP rankings\n"
+            "  python main.py draft --pick-position 3           Monte Carlo from seat #3\n"
+            "  python main.py waiver --current-gw 12 --roster-ids 10,44,87,102\n"
+        ),
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("pipeline", help="Full ingest -> project -> VORP pipeline")
 
@@ -217,6 +224,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
 
     if args.command == "pipeline":
         asyncio.run(cmd_pipeline(CONF))
