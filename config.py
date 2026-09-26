@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -88,7 +90,10 @@ class FPLConfig:
     XMIN_DROP_THRESHOLD: float = 45.0   # per-GW minutes below which a player is droppable
 
     # ── Local historical data ────────────────────────────────
-    LOCAL_DATA_DIR: str = r"C:\Users\benimki\miniconda3\envs\fpl\data"
+    # Set FPL_DATA_DIR to override; defaults to ./data next to this file.
+    LOCAL_DATA_DIR: str = field(default_factory=lambda: os.environ.get(
+        "FPL_DATA_DIR", str(Path(__file__).resolve().parent / "data"),
+    ))
 
     # ── Async HTTP ───────────────────────────────────────────
     API_CONCURRENCY: int = 20

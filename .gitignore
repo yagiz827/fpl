@@ -10,3 +10,6 @@ __pycache__/
 # İşletim sistemi kalıntıları
 .DS_Store
 Thumbs.db
+
+# Yerel geçmiş sezon verileri
+data/
